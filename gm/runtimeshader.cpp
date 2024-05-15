@@ -14,9 +14,11 @@
 #include "include/core/SkSize.h"
 #include "include/core/SkString.h"
 #include "include/core/SkSurface.h"
+#include "include/core/SkStream.h"
 #include "include/effects/SkGradientShader.h"
 #include "include/effects/SkImageFilters.h"
 #include "include/effects/SkRuntimeEffect.h"
+#include "include/encode/SkPngEncoder.h"
 #include "include/gpu/GrRecordingContext.h"
 #include "src/base/SkRandom.h"
 #include "src/core/SkColorSpacePriv.h"
@@ -24,6 +26,11 @@
 #include "tools/DecodeUtils.h"
 #include "tools/Resources.h"
 #include "tools/ToolUtils.h"
+
+#include <functional>
+#include <fstream>
+#include <vector>
+#include <cassert>
 
 enum RT_Flags {
     kAnimate_RTFlag     = 0x1,
@@ -1132,3 +1139,128 @@ DEF_SIMPLE_GM_CAN_FAIL(alpha_image_shader_rt, canvas, errorMsg, 350, 50) {
 
     return skiagm::DrawResult::kOk;
 }
+
+
+class ColorCubeRTNonUniform : public RuntimeShaderGM {
+public:
+    static const int WIDTH = 1920;
+    static const int HEIGHT = 1080;
+    static const int DISPLAY_WIDTH = 1280;
+    static const int DISPLAY_HEIGHT = 720;
+
+    ColorCubeRTNonUniform() : RuntimeShaderGM("color_cube_rt_non_uni", {DISPLAY_WIDTH, DISPLAY_HEIGHT}, "") {
+        loadShader();
+    }
+    SkBitmap fRgbBitmap;
+    SkBitmap fLut3DBitmap;
+    SkBitmap fIndicesBitmap;
+
+    void load(const std::string& path, int w, int h,
+        SkColorType color, SkAlphaType alpha, SkBitmap& out) {
+
+        return load(path, w, h, color, alpha, out, [](std::ifstream& ifs, const SkImageInfo& info, int w, int h, SkBitmap& out) {
+            int bpp = info.bytesPerPixel();
+            for (int i=0; i<h; i++) {
+                for (int j=0; j<w; j++) {
+                    uint32_t buffer;
+                    ifs.read((char*)&buffer, bpp);
+                    switch(bpp) {
+                    case 1:
+                        *out.getAddr8(j, i) = buffer;
+                        break;
+                    case 2:
+                        *out.getAddr16(j, i) = buffer;
+                        break;
+                    case 4:
+                        *out.getAddr32(j, i) = buffer;
+                        break;
+                    default:
+                        assert(false);
+                    }
+                }
+            }
+        });
+    }
+
+    void loadShader() {
+        std::ifstream ifs("resources/sksl/runtime/lutshaders.rts");
+        ifs.seekg(0, std::ios::end);
+        size_t size = ifs.tellg();
+        std::string buffer(size, ' ');
+        ifs.seekg(0);
+        ifs.read(&buffer[0], size);
+        fSkSL.set(buffer);
+    }
+
+    void load(const std::string& path, int w, int h, SkColorType color, SkAlphaType alpha, SkBitmap& out,
+        std::function<void(std::ifstream&,const SkImageInfo&,int,int,SkBitmap&)> fn) {
+        std::ifstream ifs(path, std::ios::binary);
+        auto imageInfo = SkImageInfo::Make(w, h, color, alpha,
+            SkColorSpace::MakeRGB(SkNamedTransferFn::kRec2020, SkNamedGamut::kRec2020));
+
+        out.setInfo(imageInfo);
+        out.allocPixels();
+
+        fn(ifs, imageInfo, w, h, out);
+    }
+
+    void loadRgb() {
+        load("resources/images/color_picker.rgb",
+            WIDTH, HEIGHT,
+            SkColorType::kRGB_101010x_SkColorType, SkAlphaType::kOpaque_SkAlphaType,
+            fRgbBitmap);
+    }
+
+    void load3DLut() {
+        load("resources/images/color_picker_data.bin",
+            17 * 17, 17,
+            SkColorType::kRGB_101010x_SkColorType, SkAlphaType::kOpaque_SkAlphaType,
+            fLut3DBitmap);
+    }
+
+    void loadLutIndices() {
+        load("resources/images/color_picker_axis.bin",
+            17, 3,
+            SkColorType::kA16_unorm_SkColorType, SkAlphaType::kOpaque_SkAlphaType,
+            fIndicesBitmap);
+
+        for (int i=0; i<3; i++) {
+            for (int j=0; j<17; j++) {
+                uint16_t val = *fIndicesBitmap.getAddr16(j, i);
+                //SkDebugf("[CHALOS] %d, %d = %u \n", i, j, val);
+            }
+        }
+    }
+
+    void onOnceBeforeDraw() override {
+        loadRgb();
+        load3DLut();
+        loadLutIndices();
+
+        this->RuntimeShaderGM::onOnceBeforeDraw();
+    }
+
+    void onDraw(SkCanvas* canvas) override {
+        SkRuntimeShaderBuilder builder(fEffect);
+
+        builder.uniform("sample_ratio") = float(DISPLAY_HEIGHT) / float(HEIGHT);
+        builder.uniform("colorDepth")  = 1024.0f;
+        builder.uniform("useYCbCrP10") = 0;
+
+        const SkSamplingOptions samplingRgb(SkFilterMode::kLinear);
+        builder.child("plane0") = fRgbBitmap.makeShader(samplingRgb);
+
+        const SkSamplingOptions samplingIndices(SkFilterMode::kNearest);
+        builder.child("lut_indices") = fIndicesBitmap.makeShader(samplingIndices);
+
+        // Now draw the image with an identity color cube - it should look like the original
+        builder.child("color_cube") = fLut3DBitmap.makeShader(samplingIndices);
+        auto shader = builder.makeShader();
+
+        SkPaint paint;
+
+        paint.setShader(shader);
+        canvas->drawRect({ 0, 0, WIDTH, HEIGHT }, paint);
+    }
+};
+DEF_GM(return new ColorCubeRTNonUniform;)
